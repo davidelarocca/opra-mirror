@@ -1,0 +1,80 @@
+name: Mirror OPRA
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: opra-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Download and validate OPRA's database
+        shell: bash
+        run: |
+          set -euo pipefail
+          opra_download="$(mktemp)"
+          trap 'rm -f "$opra_download"' EXIT
+          curl --fail --location --retry 3 --silent --show-error \
+            https://raw.githubusercontent.com/opra-project/OPRA/main/dist/database_v1.jsonl \
+            -o "$opra_download"
+          python3 - "$opra_download" <<'PY'
+          import collections
+          import json
+          import pathlib
+          import shutil
+          import sys
+
+          source = pathlib.Path(sys.argv[1])
+          counts = collections.Counter()
+          with source.open(encoding="utf-8") as lines:
+              for number, line in enumerate(lines, 1):
+                  if not line.strip():
+                      continue
+                  record = json.loads(line)
+                  if not isinstance(record, dict) or not isinstance(record.get("id"), str) or not isinstance(record.get("data"), dict):
+                      raise ValueError(f"Invalid record on line {number}")
+                  counts[record["type"]] += 1
+          if not all(counts[kind] > 0 for kind in ("vendor", "product", "eq")):
+              raise ValueError("The database needs vendor, product and EQ records")
+          for kind, count in sorted(counts.items()):
+              print(f"{kind}: {count:,}")
+          destination = pathlib.Path("dist")
+          destination.mkdir(exist_ok=True)
+          shutil.copyfile(source, destination / "database_v1.jsonl")
+          (destination / "LICENSE.md").write_text(
+              "# OPRA data\n\n"
+              "Manufacturer, product and EQ data is from OPRA (Open Profiles for Revealing Audio), "
+              "https://github.com/opra-project/OPRA, and is copied without modification.\n\n"
+              "The data is licensed under Creative Commons Attribution-ShareAlike 4.0 International "
+              "(CC BY-SA 4.0): https://creativecommons.org/licenses/by-sa/4.0/. "
+              "Each equalizer profile belongs to its credited author.\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Commit changed data
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- dist/database_v1.jsonl dist/LICENSE.md
+          if git diff --cached --quiet -- dist; then
+            echo "OPRA's database is unchanged."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Update mirrored OPRA database'
+          git push origin HEAD:main
